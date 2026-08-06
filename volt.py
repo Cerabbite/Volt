@@ -51,65 +51,92 @@ def extract_media(input_file_path, fps):
     result = subprocess.run(command, capture_output=True, text=True)
     metadata_string = result.stdout.strip()
 
-    if not metadata_string or metadata_string in ("()", "[]"):
+    # Safely handle empty states or lists with no media objects
+    if not metadata_string or metadata_string in ("()", "[]", "[{}]"):
         return [], None
 
     try:
         metadata_json = json.loads(metadata_string)
+        if not metadata_json or not isinstance(metadata_json, list):
+            return [], None
+
+        first_item = metadata_json[0]
+        if "value" not in first_item or "audio" not in first_item["value"]:
+            return [], None
+
+        audio_data = first_item["value"]["audio"]
+        if not isinstance(audio_data, dict):
+            return [], None
+
         audios = []
-        for audio in metadata_json[0]["value"]["audio"]:
+        for view_key, frames in audio_data.items():
+            if not isinstance(frames, dict) or "0" not in frames:
+                continue
+
+            initial_props = frames["0"]
+            start_frame = int(initial_props.get("start-frame", 0))
+
             audios.append(
-                [
-                    audio["input"],
-                    int((audio["start-frame"] / fps) * 1000),
-                    float(audio["cutoff"] / fps),
-                    float(
-                        audio.get("fade-out", 0) / fps
-                    ),  # Convert fade-out frames to seconds
-                    float(audio["volume"]),
-                ]
+                {
+                    "input": initial_props["source"],
+                    "start-ms": int((start_frame / fps) * 1000),
+                    "trim-start-ms": float(initial_props.get("trim-start-ms", 0.0)),
+                    "trim-end-ms": float(initial_props.get("trim-end-ms", 0.0)),
+                    "keyframes": frames,
+                }
             )
     except Exception as e:
         print(f"Error parsing media: {e}")
-        sys.exit(1)
+        return [], None
 
     return audios, None
 
 
-def build_audio_filter(
-    idx, audio_path, start_ms, cutoff_sec, fade_out_sec, volume, offset_ms
-):
+def build_audio_filter(idx, audio_info, fps, offset_ms):
+    audio_path = audio_info["input"]
+    start_ms = audio_info["start-ms"]
+    trim_start_ms = audio_info["trim-start-ms"]
+    trim_end_ms = audio_info["trim-end-ms"]
+    keyframes = audio_info["keyframes"]
+
     adjusted_ms = start_ms - offset_ms
-    skip_sec = 0.0
+    skip_sec = trim_start_ms / 1000.0
     if adjusted_ms < 0:
-        skip_sec = abs(adjusted_ms) / 1000.0
+        skip_sec += abs(adjusted_ms) / 1000.0
         adjusted_ms = 0
 
-    if cutoff_sec > 0 and cutoff_sec <= skip_sec:
-        return None
-
     filters = []
+
+    # Trim raw audio file source bounds if requested
     trim_parts = []
     if skip_sec > 0:
         trim_parts.append(f"start={skip_sec}")
-    if cutoff_sec > 0:
-        trim_parts.append(f"end={cutoff_sec}")
+    if trim_end_ms > 0:
+        trim_parts.append(f"end={trim_end_ms / 1000.0}")
 
     if trim_parts:
         filters.append("atrim=" + ":".join(trim_parts))
         filters.append("asetpts=PTS-STARTPTS")
 
-    # Add audio fade-out filter if cutoff and fade_out_sec are provided
-    if cutoff_sec > 0 and fade_out_sec > 0:
-        effective_duration = cutoff_sec - skip_sec
-        fade_start = max(0.0, effective_duration - fade_out_sec)
-        actual_fade_dur = min(fade_out_sec, effective_duration)
-        # Using curve=exp or curve=cbr gives a smooth bezier-like natural audio dropoff
-        filters.append(
-            f"afade=t=out:st={fade_start:.3f}:d={actual_fade_dur:.3f}:curve=exp"
-        )
+    # --- DYNAMIC VOLUME EVALUATION WITH CONTINUOUS FALLBACK ---
+    sorted_frames = sorted(keyframes.items(), key=lambda x: int(x[0]))
+    vol_exprs = []
 
-    filters.append(f"volume={volume}")
+    last_vol = 1.0
+    for frame_idx, props in sorted_frames:
+        f_num = int(frame_idx)
+        last_vol = float(props.get("volume", 1.0))
+        vol_exprs.append(rf"eq(n\,{f_num})*{last_vol}")
+
+    # If the video timeline runs past the last explicit keyframe,
+    # inherit/sustain the last known volume instead of dropping out.
+    max_keyframe_num = int(sorted_frames[-1][0]) if sorted_frames else 0
+
+    # Construct combined statement with fallback for frames > max_keyframe_num
+    combined_vol_expr = "+".join(vol_exprs)
+    combined_vol_expr = f"if(gt(n,{max_keyframe_num}), {last_vol}, {combined_vol_expr})"
+
+    filters.append(f"volume='{combined_vol_expr}':eval=frame")
     filters.append(f"adelay={adjusted_ms}|{adjusted_ms}")
 
     label = f"a{idx}"
@@ -117,7 +144,6 @@ def build_audio_filter(
 
 
 def extract_page_number(path):
-    """Extract integer page/frame index for accurate numerical sorting."""
     match = re.search(r"_(\d+)\.png$", path.name)
     return int(match.group(1)) if match else 0
 
@@ -145,7 +171,6 @@ def render_chunk_to_bytes(
     if res.returncode != 0:
         raise RuntimeError(f"Typst compilation error:\n{res.stderr}")
 
-    # Read rendered PNGs IN NUMERICAL ORDER
     rendered_paths = sorted(
         temp_dir.glob(f"chunk_{chunk_index}_*.png"), key=extract_page_number
     )
@@ -154,7 +179,7 @@ def render_chunk_to_bytes(
     for p in rendered_paths:
         with open(p, "rb") as f:
             frames_bytes.append(f.read())
-        p.unlink()  # Immediate cleanup of temporary image file
+        p.unlink()
 
     return chunk_index, frames_bytes
 
@@ -167,7 +192,7 @@ def main():
     num_args = check_arguments()
     input_file_path = get_input_file()
 
-    ppi = 36 if preview else 72  # 144 for 4k
+    ppi = 36 if preview else 72
     preset = "p1" if preview else "p6"
     crf = 30 if preview else 23
 
@@ -191,7 +216,6 @@ def main():
 
     audios, _ = extract_media(input_file_path, fps)
 
-    # Configure FFmpeg pipe reader
     ffmpeg_cmd = [
         "ffmpeg",
         "-y",
@@ -205,17 +229,12 @@ def main():
         "pipe:0",
     ]
 
-    # Handle Audio Streams
     offset_ms = (start_sec or 0) * 1000
     filter_chains, mix_labels = [], []
 
-    for idx, (audio_path, start_ms, cutoff_sec, fade_out_sec, volume) in enumerate(
-        audios, start=1
-    ):
-        ffmpeg_cmd.extend(["-i", str(audio_path)])
-        result = build_audio_filter(
-            idx, audio_path, start_ms, cutoff_sec, fade_out_sec, volume, offset_ms
-        )
+    for idx, audio_info in enumerate(audios, start=1):
+        ffmpeg_cmd.extend(["-i", str(audio_info["input"])])
+        result = build_audio_filter(idx, audio_info, fps, offset_ms)
         if result:
             chain, label = result
             filter_chains.append(chain)
@@ -236,7 +255,6 @@ def main():
 
     output_video_path = input_file_path.with_suffix(".mp4")
 
-    # Limit output duration explicitly to match requested clip
     ffmpeg_cmd.extend(
         [
             "-t",
@@ -270,8 +288,6 @@ def main():
     temp_dir = Path("./.frames_tmp")
     temp_dir.mkdir(exist_ok=True)
 
-    # SMART THRESHOLD: If rendering < 500 frames (small clip/preview),
-    # run 1 single Typst process to avoid CLI re-parsing penalty.
     if total_to_render < 500:
         print(
             f"Rendering {total_to_render} frames in 1 single Typst call (Fast Path)..."
@@ -286,7 +302,6 @@ def main():
         except (BrokenPipeError, IOError):
             pass
     else:
-        # High Frame Count: Parallelize across cores
         chunk_size = max(150, (total_to_render + cpu_count - 1) // cpu_count)
         chunks = []
         curr = start_frame

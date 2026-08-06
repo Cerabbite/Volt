@@ -1,4 +1,3 @@
-
 #let normal-rect = rect
 #let normal-image = image
 #let normal-text = text

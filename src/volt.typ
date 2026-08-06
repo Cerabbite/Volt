@@ -6,6 +6,34 @@
 #let media-state = state("media-state", ("audio": (), "video": ()))
 #let registered-views = state("registered-views", ())
 
+#let assign-tree-ids(objects, path) = {
+  let out = (:)
+  let idx = 0
+  for (key, obj) in objects.pairs() {
+    let obj-path = path + "-" + str(idx)
+    if type(obj) == dictionary and obj.at("is-sequence", default: false) {
+      let pos-args = obj.positional-arguments
+      let ided-inner = assign-tree-ids(pos-args.at("objects"), obj-path)
+      let new-pos-args = pos-args
+      new-pos-args.insert("objects", ided-inner)
+      let new-obj = obj
+      new-obj.insert("positional-arguments", new-pos-args)
+      out.insert(key, new-obj)
+    } else if type(obj) == dictionary and "arguments" in obj and "id" in obj.arguments {
+      let args = obj.arguments
+      args.insert("id", obj-path)
+      let new-obj = obj
+      new-obj.insert("arguments", args)
+      out.insert(key, new-obj)
+    } else {
+      out.insert(key, obj)
+    }
+    idx += 1
+  }
+  return out
+}
+
+
 #let clean-key(k) = {
   let str-k = str(k)
   if "#" in str-k {
@@ -389,7 +417,10 @@
   let draw-fn = obj-dict.at("draw-function")
   let pos-args = obj-dict.at("positional-arguments", default: (:)).values()
   let draw-args = obj-dict.at("arguments", default: (:))
-
+  if base-obj.at("frame", default: false) {
+    let body-content = draw-fn(..pos-args, ..draw-args, frame: relative-frame)
+    return body-content
+  }
   let body-content = draw-fn(..pos-args, ..draw-args)
 
   let dx = obj-dict.at("vmove-x", default: 0pt)
@@ -467,14 +498,16 @@
           rendered-elements.push(child-rendered)
         }
       }
-    } else if type(raw-obj) == dictionary and raw-obj.at("is-audio", default: false) {
-      continue
     } else {
       let obj-args = if type(raw-obj) == dictionary { raw-obj.at("arguments", default: (:)) } else { (:) }
       let obj-start = obj-args.at("start-frame", default: 0)
 
       if scaled-local-frame >= obj-start {
         let rendered-obj = render-single-object(raw-obj, tracks, scaled-local-frame)
+        if type(raw-obj) == dictionary and raw-obj.at("is-audio", default: false) {
+          rendered-elements.push(rendered-obj)
+          continue
+        }
         let obj-align = if type(raw-obj) == dictionary and "valign" in raw-obj {
           raw-obj.valign
         } else {
@@ -539,7 +572,6 @@
 ) = {
   context {
     let natural-frames = duration-state.final()
-    let final-media-state = media-state.final()
 
     let duration-frames = if duration-ms > 0 {
       int((duration-ms / 1000) * fps)
@@ -564,7 +596,21 @@
       current-frame: start-frame,
     )
 
-    let all-views = registered-views.final()
+    let all-views = registered-views
+      .final()
+      .enumerate()
+      .map(pair => {
+        let (view-index, v) = pair
+        let pos-args = v.sequence.positional-arguments
+        let ided-objects = assign-tree-ids(pos-args.at("objects"), "view-" + str(view-index))
+        let new-pos-args = pos-args
+        new-pos-args.insert("objects", ided-objects)
+        let new-sequence = v.sequence
+        new-sequence.insert("positional-arguments", new-pos-args)
+        let new-v = v
+        new-v.insert("sequence", new-sequence)
+        new-v
+      })
 
     for f in range(start-frame, end-frame + 1) {
       let frame-content = ()
@@ -583,24 +629,90 @@
       [#frame-content.join()#pagebreak()]
     }
 
+    let final-media-state = media-state.final()
     [#metadata(config)<editor-config>#metadata(final-media-state)<media-state>]
   }
 }
 
-#let audio(input, start-frame: 0, cutoff: 0, volume: 1, fade-out: 0) = {
-  media-state.update(curr => {
-    let audio-list = curr.at("audio", default: ())
+#let create-audio(
+  source,
+  start-frame: 0,
+  trim-start-ms: 0,
+  trim-end-ms: 0,
+  duration: 0,
+  fade-out: 0,
+  volume: 1.0,
+  speed: 1.0,
+  pitch: 1.0,
+  sample-rate: 44100,
+  id: none,
+  frame: -1,
+) = {
+  if id == none {
+    panic(
+      "volt internal error: audio object id was not assigned before rendering (assign-tree-ids/init-editor ordering bug)",
+    )
+  }
+  if frame < 0 {
+    panic("Frame cannot be less then 0", frame)
+  }
 
-    let new-entry = (
-      input: input,
+  media-state.update(st => {
+    // Force st.audio to be a dictionary, overriding the old array default if present
+    let audio-dict = if type(st.audio) == dictionary { st.audio } else { (:) }
+
+    let obj-frames = audio-dict.at(id, default: (:))
+
+    obj-frames.insert(str(frame), (
+      source: source,
       start-frame: start-frame,
-      cutoff: cutoff,
+      trim-start-ms: trim-start-ms,
+      trim-end-ms: trim-end-ms,
+      duration: duration,
       fade-out: fade-out,
       volume: volume,
-    )
+      speed: speed,
+      pitch: pitch,
+      sample-rate: sample-rate,
+    ))
 
-    audio-list.push(new-entry)
-    curr.insert("audio", audio-list)
-    curr
+    audio-dict.insert(id, obj-frames)
+
+    (
+      audio: audio-dict,
+      video: if type(st.at("video", default: none)) == dictionary { st.video } else { (:) },
+    )
   })
+}
+
+#let audio(
+  source,
+  start-frame: 0,
+  trim-start-ms: 0,
+  trim-end-ms: 0,
+  duration: 0,
+  fade-out: 0,
+  volume: 1.0,
+  speed: 1.0,
+  pitch: 1.0,
+  sample-rate: 44100,
+) = {
+  (
+    "draw-function": create-audio,
+    "is-audio": true,
+    "positional-arguments": ("source": source),
+    "arguments": (
+      "start-frame": start-frame,
+      "trim-start-ms": trim-start-ms,
+      "trim-end-ms": trim-end-ms,
+      "duration": duration,
+      "fade-out": fade-out,
+      "volume": volume,
+      "speed": speed,
+      "pitch": pitch,
+      "sample-rate": sample-rate,
+      "id": none,
+    ),
+    "frame": true,
+  )
 }
